@@ -203,6 +203,14 @@ jobs:
         include:
           - sub_level: "138"
             os_patch_level: "2025-06"
+    uses: ./.github/workflows/build.yml
+    secrets: inherit
+    with:
+      android_version: "android14"
+      kernel_version: "6.1"
+      sub_level: ${{ matrix.sub_level }}
+      display_sub: ${{ matrix.display_sub || '' }}
+      os_patch_level: ${{ matrix.os_patch_level }}
       ksu_variant: ${{ inputs.kernelsu_variant }}
       build_channel: ${{ inputs.build_channel }}
       ksu_commit: ${{ inputs.ksu_commit || needs.get-ksu-manager.outputs.ksuCommit }}
