@@ -43,7 +43,17 @@ if 'zs_lookup_class_index' not in s:
     open(zh, 'w').write(s.replace('size_t zs_huge_class_size(struct zs_pool *pool);',
         'size_t zs_huge_class_size(struct zs_pool *pool);\nint zs_lookup_class_index(unsigned int size);', 1))
 PY
-if [ -f "$KERNEL"/arch/arm64/configs/gki_defconfig ]; then
-	grep -q CONFIG_ZRAM_SDDC "$KERNEL"/arch/arm64/configs/gki_defconfig || cat "$HERE"/config/kds.fragment >> "$KERNEL"/arch/arm64/configs/gki_defconfig
-fi
+dedupe() {
+	f="$1"
+	[ -f "$f" ] || return 0
+	awk '!/^CONFIG_/ || !seen[$0]++' "$f" > "$f.kdstmp" && mv "$f.kdstmp" "$f"
+}
+
+for cfg in "$KERNEL"/arch/arm64/configs/gki_defconfig "$KERNEL"/arch/arm64/configs/ksu.fragment; do
+	if [ -f "$cfg" ]; then
+		grep -q CONFIG_ZRAM_SDDC "$cfg" || cat "$HERE"/config/kds.fragment >> "$cfg"
+	fi
+done
+dedupe "$KERNEL"/arch/arm64/configs/gki_defconfig
+dedupe "$KERNEL"/arch/arm64/configs/ksu.fragment
 echo "overlay done"
