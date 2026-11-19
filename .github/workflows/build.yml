@@ -1270,6 +1270,11 @@ jobs:
             echo "::warning::lz4k_oplus.patch 应用失败，可能已应用或上下文不匹配"
           fi
 
+      - name: 配置 lz4kds SDDC 槽位去重
+        if: inputs.use_zram && inputs.kernel_version == '6.1' && env.ZRAM_SKIPPED != 'true'
+        working-directory: ${{ env.KERNEL_ROOT }}/common
+        run: sh "$GITHUB_WORKSPACE/kds/scripts/overlay-kds.sh" .
+
       - name: 修复 6.6 WiFi/蓝牙兼容性（三星 + 小米）
         if: inputs.kernel_version == '6.6'
         working-directory: ${{ env.KERNEL_ROOT }}/common
