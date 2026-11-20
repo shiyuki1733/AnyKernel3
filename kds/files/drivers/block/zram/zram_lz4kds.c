@@ -86,3 +86,10 @@ const struct zcomp_backend_ops lz4kds_zcomp_ops = {
 	.decompress_delta = lz4kds_decompress_delta,
 	.ctx_size = LZ4KDS_ENC_STATE_BYTES,
 };
+
+/* Same codec, SDDC alias dedup only (no delta), for A/B on-device testing. */
+const struct zcomp_backend_ops lz4kdsn_zcomp_ops = {
+	.compress = lz4kds_compress,
+	.decompress = lz4kds_decompress,
+	.ctx_size = LZ4KDS_ENC_STATE_BYTES,
+};

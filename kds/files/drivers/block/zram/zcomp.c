@@ -17,6 +17,7 @@
 
 #if IS_ENABLED(CONFIG_ZRAM_SDDC)
 extern const struct zcomp_backend_ops lz4kds_zcomp_ops;
+extern const struct zcomp_backend_ops lz4kdsn_zcomp_ops;
 #endif
 
 static const char * const backends[] = {
@@ -44,6 +45,7 @@ static const char * const backends[] = {
 #endif
 #if IS_ENABLED(CONFIG_ZRAM_SDDC)
 	"lz4kds",
+	"lz4kdsn",
 #endif
 #if IS_ENABLED(CONFIG_CRYPTO_842)
 	"842",
@@ -59,6 +61,8 @@ static const struct zcomp_backend_ops *zcomp_direct_ops(const char *name)
 #if IS_ENABLED(CONFIG_ZRAM_SDDC)
 	if (!strcmp(name, "lz4kds"))
 		return &lz4kds_zcomp_ops;
+	if (!strcmp(name, "lz4kdsn"))
+		return &lz4kdsn_zcomp_ops;
 #endif
 	return NULL;
 }

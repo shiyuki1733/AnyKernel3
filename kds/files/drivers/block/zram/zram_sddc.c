@@ -261,17 +261,16 @@ static int sddc_store(struct zram_sddc *sddc, struct page *page,
 	/* 1. plain compression of the page */
 	zstrm = zcomp_stream_get(sddc->comp);
 	ret = zcomp_compress(zstrm, sddc->enc_pair + PAGE_SIZE, &slen);
-	if (!ret)
-		memcpy(sddc->enc_out, zstrm->buffer, slen);
-	zcomp_stream_put(sddc->comp);
-	if (ret)
+	if (ret || slen == 0 || slen >= PAGE_SIZE ||
+	    slen >= sddc->huge_class_size) {
+		zcomp_stream_put(sddc->comp);
+		/* Let the caller store the raw page, like the stock path. */
 		return -EAGAIN;
+	}
+	memcpy(sddc->enc_out, zstrm->buffer, slen);
+	zcomp_stream_put(sddc->comp);
 
 	shash = sddc_hash_bytes(sddc->enc_out, slen);
-
-	/* Let the caller store the raw page, exactly like the stock path. */
-	if (slen >= PAGE_SIZE || slen >= sddc->huge_class_size)
-		return -EAGAIN;
 
 	/* 2. collect candidates, pinning them while the bucket lock is held */
 	bucket = sddc_bucket(sddc, sample);
@@ -533,9 +532,6 @@ struct zram_sddc *zram_sddc_create(struct zs_pool *pool, struct zcomp *comp,
 				   unsigned long huge_class_size)
 {
 	struct zram_sddc *sddc;
-
-	if (!zcomp_has_delta(comp))
-		return NULL;
 
 	sddc = kzalloc(sizeof(*sddc), GFP_KERNEL);
 	if (!sddc)
