@@ -50,6 +50,10 @@
 #define SDDC_BUCKET_WAYS	6
 #define SDDC_HASH_SEED		0x9e3779b9
 
+/* LZ4KD needs >= 5 bytes of delta input and the wire must fit one page. */
+#define SDDC_DELTA_LIMIT	(PAGE_SIZE - SDDC_HDR_BYTES)
+#define SDDC_DELTA_MIN_BYTES	8
+
 enum sddc_kind {
 	SDDC_KIND_REF = 1,
 	SDDC_KIND_ALIAS,
@@ -95,6 +99,7 @@ struct zram_sddc {
 	void *enc_pair;		/* 2 contiguous pages: ref | target */
 	void *enc_out;		/* 1 page: stream / delta wire */
 	void *enc_tmp;		/* 1 page: candidate stream copy */
+	void *proof_pair;	/* 2 contiguous pages: round-trip proof */
 	struct mutex enc_lock;
 
 	/* decode scratch, serialised by ->dec_lock */
@@ -107,6 +112,7 @@ struct zram_sddc {
 	atomic64_t delta_hits;
 	atomic64_t fallbacks;
 	atomic64_t read_errors;
+	atomic64_t proof_failures;
 };
 
 static u32 sddc_hash_bytes(const void *buf, unsigned int len)
@@ -312,6 +318,8 @@ static int sddc_store(struct zram_sddc *sddc, struct page *page,
 	if (slen > PAGE_SIZE / 8 && zcomp_has_delta(sddc->comp)) {
 		for (i = 0; i < ncand; i++) {
 			struct sddc_meta *c = cand[i];
+			void *payload = sddc->enc_out + SDDC_HDR_BYTES;
+			bool proof_bad = false;
 
 			if (!c)
 				continue;
@@ -325,15 +333,36 @@ static int sddc_store(struct zram_sddc *sddc, struct page *page,
 				ret = zcomp_compress_delta(zstrm,
 						sddc->enc_pair,
 						sddc->enc_pair + PAGE_SIZE,
-						&dlen, PAGE_SIZE);
+						&dlen, SDDC_DELTA_LIMIT);
+			if (!ret && (dlen < SDDC_DELTA_MIN_BYTES ||
+				     dlen > SDDC_DELTA_LIMIT))
+				ret = -E2BIG;
 			if (!ret) {
-				if (SDDC_HDR_BYTES + dlen > PAGE_SIZE)
-					ret = -E2BIG;
-				else
-					memcpy(sddc->enc_out + SDDC_HDR_BYTES,
-					       zstrm->buffer, dlen);
+				memcpy(payload, zstrm->buffer, dlen);
+				/*
+				 * Round-trip proof, exactly like the reference
+				 * implementation: never commit a delta that the
+				 * codec cannot restore to the exact page.
+				 */
+				memcpy(sddc->proof_pair, sddc->enc_pair,
+				       PAGE_SIZE);
+				memcpy(sddc->proof_pair + PAGE_SIZE,
+				       sddc->enc_pair + PAGE_SIZE, PAGE_SIZE);
+				if (zcomp_decompress_delta(zstrm, payload, dlen,
+						sddc->proof_pair,
+						sddc->proof_pair + PAGE_SIZE) ||
+				    memcmp(sddc->proof_pair + PAGE_SIZE,
+					   sddc->enc_pair + PAGE_SIZE,
+					   PAGE_SIZE))
+					proof_bad = true;
 			}
 			zcomp_stream_put(sddc->comp);
+			if (proof_bad) {
+				atomic64_inc(&sddc->proof_failures);
+				pr_info_ratelimited("lz4kds: delta proof failed (%u bytes)\n",
+						    dlen);
+				continue;
+			}
 			if (ret)
 				continue;
 
@@ -552,10 +581,11 @@ struct zram_sddc *zram_sddc_create(struct zs_pool *pool, struct zcomp *comp,
 	sddc->dec_pair = (void *)__get_free_pages(GFP_KERNEL | __GFP_ZERO, 1);
 	sddc->dec_hdr = (void *)__get_free_page(GFP_KERNEL | __GFP_ZERO);
 	sddc->dec_tmp = (void *)__get_free_page(GFP_KERNEL | __GFP_ZERO);
+	sddc->proof_pair = (void *)__get_free_pages(GFP_KERNEL | __GFP_ZERO, 1);
 
 	if (!sddc->buckets || !sddc->enc_pair || !sddc->enc_out ||
 	    !sddc->enc_tmp || !sddc->dec_pair || !sddc->dec_hdr ||
-	    !sddc->dec_tmp)
+	    !sddc->dec_tmp || !sddc->proof_pair)
 		goto err;
 
 	return sddc;
@@ -574,6 +604,7 @@ void zram_sddc_destroy(struct zram_sddc *sddc)
 	free_page((unsigned long)sddc->enc_out);
 	free_page((unsigned long)sddc->enc_tmp);
 	free_pages((unsigned long)sddc->dec_pair, 1);
+	free_pages((unsigned long)sddc->proof_pair, 1);
 	free_page((unsigned long)sddc->dec_hdr);
 	free_page((unsigned long)sddc->dec_tmp);
 	kfree(sddc);

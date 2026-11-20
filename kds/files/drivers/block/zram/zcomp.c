@@ -231,20 +231,20 @@ bool zcomp_has_delta(struct zcomp *comp)
 }
 
 int zcomp_compress_delta(struct zcomp_strm *zstrm, const void *ref,
-		const void *dst_page, unsigned int *dst_len, unsigned int out_max)
+		const void *dst_page, unsigned int *dst_len,
+		unsigned int out_limit)
 {
-	size_t len;
+	size_t len = PAGE_SIZE * 2;
 	int ret;
 
 	if (!zstrm->ops || !zstrm->ops->compress_delta)
 		return -EOPNOTSUPP;
 
-	len = out_max;
 	ret = zstrm->ops->compress_delta(zstrm->ctx, ref, dst_page, PAGE_SIZE,
-					 zstrm->buffer, &len, out_max);
+					 zstrm->buffer, &len, out_limit);
 	if (ret)
 		return ret;
-	if (len > out_max)
+	if (len > out_limit)
 		return -EINVAL;
 	*dst_len = (unsigned int)len;
 	return 0;
