@@ -125,6 +125,8 @@ struct zram_sddc {
 	int dbg_refdec_ret, dbg_ddec_ret;
 	u32 last_slen, last_dlen, last_wire;
 	u8 dbg_ref_head[16], dbg_tgt_head[16];
+	atomic64_t load_entries;
+	u8 dbg_pg_head[16], dbg_pg_off, dbg_st_off;
 };
 
 static u32 sddc_hash_bytes(const void *buf, unsigned int len)
@@ -371,8 +373,8 @@ static int sddc_store(struct zram_sddc *sddc, struct page *page,
 				 */
 				memcpy(sddc->proof_pair, sddc->enc_pair,
 				       PAGE_SIZE);
-				memcpy(sddc->proof_pair + PAGE_SIZE,
-				       sddc->enc_pair + PAGE_SIZE, PAGE_SIZE);
+				memset(sddc->proof_pair + PAGE_SIZE, 0xa5,
+				       PAGE_SIZE);
 				if (trace)
 					SDDC_MARK("d-proof", i, dlen);
 				ret = zcomp_decompress_delta(zstrm, payload, dlen,
@@ -508,6 +510,7 @@ int zram_sddc_load(struct zram_sddc *sddc, void *meta_ptr, struct page *page)
 		return -EIO;
 
 	spin_lock(&sddc->dec_lock);
+	atomic64_inc(&sddc->load_entries);
 	trace = atomic_inc_return(&dbg_cnt) <= 48;
 
 	if (meta->kind == SDDC_KIND_REF || meta->kind == SDDC_KIND_ALIAS) {
@@ -522,6 +525,10 @@ int zram_sddc_load(struct zram_sddc *sddc, void *meta_ptr, struct page *page)
 		ret = zcomp_decompress(zstrm, sddc->dec_tmp, ref->wire_len,
 				       pagebuf);
 		zcomp_stream_put(sddc->comp);
+		if (!ret) {
+			memcpy(sddc->dbg_pg_head, pagebuf, 16);
+			sddc->dbg_pg_off = ((u8 *)pagebuf)[107];
+		}
 		kunmap_atomic(pagebuf);
 		if (ret)
 			atomic64_inc(&sddc->read_errors);
@@ -584,9 +591,12 @@ int zram_sddc_load(struct zram_sddc *sddc, void *meta_ptr, struct page *page)
 			SDDC_MARK("l-dok", hdr->payload_len, (unsigned)-ret);
 		if (!ret) {
 			memcpy(sddc->dbg_tgt_head, sddc->dec_pair + PAGE_SIZE, 16);
+			sddc->dbg_st_off = ((u8 *)sddc->dec_pair + PAGE_SIZE)[107];
 			sddc->dbg_stage = 0;
 			pagebuf = kmap_atomic(page);
 			memcpy(pagebuf, sddc->dec_pair + PAGE_SIZE, PAGE_SIZE);
+			memcpy(sddc->dbg_pg_head, pagebuf, 16);
+			sddc->dbg_pg_off = ((u8 *)pagebuf)[107];
 			kunmap_atomic(pagebuf);
 		} else {
 			sddc->dbg_stage = 3;
@@ -680,7 +690,7 @@ void zram_sddc_destroy(struct zram_sddc *sddc)
 
 ssize_t zram_sddc_stat(struct zram_sddc *sddc, char *buf, size_t len)
 {
-	char rh[33], th[33];
+	char rh[33], th[33], ph[33];
 	int i;
 
 	if (!sddc)
@@ -688,25 +698,28 @@ ssize_t zram_sddc_stat(struct zram_sddc *sddc, char *buf, size_t len)
 	for (i = 0; i < 16; i++) {
 		snprintf(rh + 2 * i, 3, "%02x", sddc->dbg_ref_head[i]);
 		snprintf(th + 2 * i, 3, "%02x", sddc->dbg_tgt_head[i]);
+		snprintf(ph + 2 * i, 3, "%02x", sddc->dbg_pg_head[i]);
 	}
 	rh[32] = 0;
 	th[32] = 0;
+	ph[32] = 0;
 	return scnprintf(buf, len,
-		"alias=%llu delta=%llu fallback=%llu read_err=%llu proof_fail=%llu\n"
+		"alias=%llu delta=%llu fallback=%llu read_err=%llu proof_fail=%llu load_entries=%llu\n"
 		"stage=%u magic=%08x kind=%u plen=%u wire=%u\n"
 		"ref_hash=%08x hdr_ref=%08x phash=%08x calc_phash=%08x\n"
 		"refdec_ret=%d ddec_ret=%d last_slen=%u last_dlen=%u last_wire=%u\n"
-		"ref_head=%s tgt_head=%s\n",
+		"ref_head=%s tgt_head=%s pg_head=%s st_off=%u pg_off=%u\n",
 		(u64)atomic64_read(&sddc->alias_hits),
 		(u64)atomic64_read(&sddc->delta_hits),
 		(u64)atomic64_read(&sddc->fallbacks),
 		(u64)atomic64_read(&sddc->read_errors),
 		(u64)atomic64_read(&sddc->proof_failures),
+		(u64)atomic64_read(&sddc->load_entries),
 		sddc->dbg_stage, sddc->dbg_magic, sddc->dbg_kind,
 		sddc->dbg_plen, sddc->dbg_wire,
 		sddc->dbg_ref_hash, sddc->dbg_hdr_ref,
 		sddc->dbg_phash, sddc->dbg_calc_phash,
 		sddc->dbg_refdec_ret, sddc->dbg_ddec_ret,
 		sddc->last_slen, sddc->last_dlen, sddc->last_wire,
-		rh, th);
+		rh, th, ph, sddc->dbg_st_off, sddc->dbg_pg_off);
 }
