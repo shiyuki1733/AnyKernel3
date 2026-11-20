@@ -36,6 +36,7 @@
 #include <linux/spinlock.h>
 #include <linux/string.h>
 #include <linux/vmalloc.h>
+#include <linux/workqueue.h>
 #include <linux/zsmalloc.h>
 
 #include "zcomp.h"
@@ -77,11 +78,14 @@ struct sddc_wire_hdr {
 } __packed;
 
 struct sddc_meta {
+	struct zram_sddc *sddc;	/* owning manager, for deferred free */
 	struct sddc_meta *ref;	/* reference slot, NULL for REF */
 	unsigned long handle;	/* own stream (REF and DELTA only) */
+	struct work_struct free_work;
 	int dependents;
 	int orphan;
 	int kind;
+	u32 gen;		/* generation, guards pointer reuse (ABA) */
 	u32 stream_hash;	/* hash of own stream; for DELTA the ref's hash */
 	u32 sample_hash;	/* head/tail page sample hash, bucket key */
 	u16 wire_len;		/* bytes stored in zsmalloc */
@@ -99,6 +103,8 @@ struct zram_sddc {
 
 	struct sddc_bucket *buckets;
 	spinlock_t bucket_lock;
+	struct workqueue_struct *free_wq;
+	atomic_t next_gen;
 
 	/* encode scratch, serialised by ->enc_lock */
 	void *enc_pair;		/* 2 contiguous pages: ref | target */
@@ -191,7 +197,20 @@ static void sddc_read_stream(struct zram_sddc *sddc, unsigned long handle,
 	zs_unmap_object(sddc->pool, handle);
 }
 
-/* Drop a pin; the last pin of an orphaned metadata frees it. */
+/* Release the last pin: physical zsmalloc object and metadata go to the
+ * free workqueue, outside any slot or bucket lock. */
+static void sddc_free_workfn(struct work_struct *work)
+{
+	struct sddc_meta *meta = container_of(work, struct sddc_meta, free_work);
+	struct zram_sddc *sddc = meta->sddc;
+
+	if (meta->handle)
+		zs_free(sddc->pool, meta->handle);
+	atomic64_dec(&sddc->meta_alive);
+	kfree(meta);
+}
+
+/* Drop a pin; the last pin of an orphaned metadata frees it on the wq. */
 static void sddc_put(struct zram_sddc *sddc, struct sddc_meta *meta)
 {
 	bool last;
@@ -203,22 +222,57 @@ static void sddc_put(struct zram_sddc *sddc, struct sddc_meta *meta)
 	last = (--meta->dependents == 0) && meta->orphan;
 	spin_unlock(&sddc->bucket_lock);
 
-	if (last) {
-		if (meta->handle)
-			zs_free(sddc->pool, meta->handle);
-		atomic64_dec(&sddc->meta_alive);
-		kfree(meta);
-	}
+	if (last)
+		queue_work(sddc->free_wq, &meta->free_work);
+}
+
+static struct sddc_meta *sddc_meta_alloc(struct zram_sddc *sddc, int kind)
+{
+	struct sddc_meta *meta = kzalloc(sizeof(*meta), GFP_NOIO);
+	u32 gen;
+
+	if (!meta)
+		return NULL;
+
+	gen = (u32)atomic_inc_return(&sddc->next_gen);
+	if (!gen)
+		gen = (u32)atomic_inc_return(&sddc->next_gen);
+
+	meta->sddc = sddc;
+	meta->kind = kind;
+	meta->gen = gen;
+	INIT_WORK(&meta->free_work, sddc_free_workfn);
+	atomic64_inc(&sddc->meta_alive);
+	return meta;
 }
 
 /* Pin a candidate while the bucket lock is held. */
 static struct sddc_meta *sddc_get_locked(struct zram_sddc *sddc,
 					 struct sddc_meta *meta)
 {
-	if (!meta || meta->kind != SDDC_KIND_REF || meta->orphan)
+	if (!meta || meta->kind != SDDC_KIND_REF || meta->orphan || !meta->gen)
 		return NULL;
 	meta->dependents++;
 	return meta;
+}
+
+/* Transiently pin a reference for the duration of a read; validates kind and
+ * generation under the bucket lock before handing it out.  An orphaned ref
+ * (its own slot freed) is still kept alive by its dependents and stays valid. */
+static struct sddc_meta *sddc_pin_ref(struct zram_sddc *sddc,
+				      struct sddc_meta *ref)
+{
+	if (!ref)
+		return NULL;
+
+	spin_lock(&sddc->bucket_lock);
+	if (ref->kind != SDDC_KIND_REF || !ref->gen) {
+		spin_unlock(&sddc->bucket_lock);
+		return NULL;
+	}
+	ref->dependents++;
+	spin_unlock(&sddc->bucket_lock);
+	return ref;
 }
 
 static void sddc_unindex(struct zram_sddc *sddc, struct sddc_meta *meta)
@@ -332,19 +386,17 @@ static int sddc_store(struct zram_sddc *sddc, struct page *page,
 		sddc_read_stream(sddc, cand[i]->handle, slen, sddc->enc_tmp);
 		if (memcmp(sddc->enc_tmp, sddc->enc_out, slen))
 			continue;
-		meta = kzalloc(sizeof(*meta), GFP_NOIO);
+		meta = sddc_meta_alloc(sddc, SDDC_KIND_ALIAS);
 		if (!meta) {
 			ret = -ENOMEM;
 			goto drop;
 		}
 		meta->ref = cand[i];
-		meta->kind = SDDC_KIND_ALIAS;
 		meta->wire_len = 0;
 		meta->target_len = PAGE_SIZE;
 		meta->stream_hash = shash;
 		cand[i] = NULL;	/* the new slot takes over the pin */
 		atomic64_inc(&sddc->alias_hits);
-		atomic64_inc(&sddc->meta_alive);
 		out->meta = meta;
 		out->handle = 0;
 		out->size = 0;
@@ -471,20 +523,18 @@ static int sddc_store(struct zram_sddc *sddc, struct page *page,
 			if (trace)
 				SDDC_MARK("d-wrote", sel, wire_len);
 
-			meta = kzalloc(sizeof(*meta), GFP_NOIO);
+			meta = sddc_meta_alloc(sddc, SDDC_KIND_DELTA);
 			if (!meta) {
 				zs_free(sddc->pool, handle);
 				goto plain;
 			}
 			meta->ref = c;
 			meta->handle = handle;
-			meta->kind = SDDC_KIND_DELTA;
 			meta->wire_len = wire_len;
 			meta->target_len = PAGE_SIZE;
 			meta->stream_hash = c->stream_hash;
 			cand[sel] = NULL;	/* pin transferred to the new meta */
 			atomic64_inc(&sddc->delta_hits);
-			atomic64_inc(&sddc->meta_alive);
 			out->meta = meta;
 			out->handle = handle;
 			out->size = wire_len;
@@ -502,15 +552,13 @@ plain:
 
 	/* 5. promote the new slot to a reference when it is worth indexing */
 	if (slen >= SDDC_INDEX_MIN_BYTES && slen < sddc->huge_class_size) {
-		meta = kzalloc(sizeof(*meta), GFP_NOIO);
+		meta = sddc_meta_alloc(sddc, SDDC_KIND_REF);
 		if (meta) {
-			meta->kind = SDDC_KIND_REF;
 			meta->handle = handle;
 			meta->wire_len = slen;
 			meta->target_len = PAGE_SIZE;
 			meta->stream_hash = shash;
 			meta->sample_hash = sample;
-			atomic64_inc(&sddc->meta_alive);
 			spin_lock(&sddc->bucket_lock);
 			sddc_index(sddc, meta);
 			spin_unlock(&sddc->bucket_lock);
@@ -538,7 +586,7 @@ drop:
 int zram_sddc_load(struct zram_sddc *sddc, void *meta_ptr, struct page *page)
 {
 	struct sddc_meta *meta = meta_ptr;
-	struct sddc_meta *ref;
+	struct sddc_meta *ref, *pinned = NULL;
 	struct zcomp_strm *zstrm;
 	struct sddc_wire_hdr *hdr;
 	void *pagebuf;
@@ -554,9 +602,13 @@ int zram_sddc_load(struct zram_sddc *sddc, void *meta_ptr, struct page *page)
 	trace = atomic_inc_return(&dbg_cnt) <= 48;
 
 	if (meta->kind == SDDC_KIND_REF || meta->kind == SDDC_KIND_ALIAS) {
-		ref = (meta->kind == SDDC_KIND_REF) ? meta : meta->ref;
-		if (!ref)
+		ref = sddc_pin_ref(sddc, (meta->kind == SDDC_KIND_REF) ?
+				   meta : meta->ref);
+		if (!ref) {
+			atomic64_inc(&sddc->read_errors);
 			goto out;
+		}
+		pinned = ref;
 
 		sddc_read_stream(sddc, ref->handle, ref->wire_len,
 				 sddc->dec_tmp);
@@ -578,9 +630,12 @@ int zram_sddc_load(struct zram_sddc *sddc, void *meta_ptr, struct page *page)
 	if (meta->kind != SDDC_KIND_DELTA)
 		goto out;
 
-	ref = meta->ref;
-	if (!ref)
+	ref = sddc_pin_ref(sddc, meta->ref);
+	if (!ref) {
+		atomic64_inc(&sddc->read_errors);
 		goto out;
+	}
+	pinned = ref;
 
 	if (trace)
 		SDDC_MARK("l-wire", meta->wire_len, 0);
@@ -649,6 +704,8 @@ int zram_sddc_load(struct zram_sddc *sddc, void *meta_ptr, struct page *page)
 	zcomp_stream_put(sddc->comp);
 
 out:
+	if (pinned)
+		sddc_put(sddc, pinned);
 	spin_unlock(&sddc->dec_lock);
 	if (ret) {
 		if (atomic64_read(&sddc->read_errors) > 32)
@@ -701,7 +758,11 @@ struct zram_sddc *zram_sddc_create(struct zs_pool *pool, struct zcomp *comp,
 	mutex_init(&sddc->enc_lock);
 	spin_lock_init(&sddc->dec_lock);
 	atomic_set(&sddc->mode, 2);
+	atomic_set(&sddc->next_gen, 0);
 	sddc->fail_zero = true;
+	sddc->free_wq = alloc_workqueue("kds-sddc-free", WQ_UNBOUND, 0);
+	if (!sddc->free_wq)
+		goto err;
 	strscpy(sddc->comp_name, comp->name ? comp->name : "?",
 		sizeof(sddc->comp_name));
 	sddc->has_delta = zcomp_has_delta(comp);
@@ -732,6 +793,10 @@ void zram_sddc_destroy(struct zram_sddc *sddc)
 	if (!sddc)
 		return;
 
+	if (sddc->free_wq) {
+		flush_workqueue(sddc->free_wq);
+		destroy_workqueue(sddc->free_wq);
+	}
 	vfree(sddc->buckets);
 	free_pages((unsigned long)sddc->enc_pair, 1);
 	free_page((unsigned long)sddc->enc_out);
