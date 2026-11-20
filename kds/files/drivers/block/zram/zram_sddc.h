@@ -30,4 +30,7 @@ int zram_sddc_load(struct zram_sddc *sddc, void *meta, struct page *page);
 void zram_sddc_free_slot(struct zram_sddc *sddc, void *meta);
 ssize_t zram_sddc_stat(struct zram_sddc *sddc, char *buf, size_t len);
 
+int zram_sddc_mode_get(struct zram_sddc *sddc);
+void zram_sddc_mode_set(struct zram_sddc *sddc, int mode);
+
 #endif

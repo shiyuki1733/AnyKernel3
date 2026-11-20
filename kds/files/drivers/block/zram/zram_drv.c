@@ -1172,6 +1172,28 @@ static ssize_t sddc_stat_show(struct device *dev,
 	return ret;
 }
 static DEVICE_ATTR_RO(sddc_stat);
+
+static ssize_t sddc_mode_show(struct device *dev,
+		struct device_attribute *attr, char *buf)
+{
+	struct zram *zram = dev_to_zram(dev);
+
+	return scnprintf(buf, PAGE_SIZE, "%d\n",
+			 zram_sddc_mode_get(zram->sddc));
+}
+
+static ssize_t sddc_mode_store(struct device *dev,
+		struct device_attribute *attr, const char *buf, size_t len)
+{
+	struct zram *zram = dev_to_zram(dev);
+	int mode;
+
+	if (kstrtoint(buf, 10, &mode))
+		return -EINVAL;
+	zram_sddc_mode_set(zram->sddc, mode);
+	return len;
+}
+static DEVICE_ATTR_RW(sddc_mode);
 #endif
 
 static DEVICE_ATTR_RO(io_stat);
@@ -1300,7 +1322,6 @@ static int __zram_bvec_read(struct zram *zram, struct page *page, u32 index,
 		ret = zram_sddc_load(zram->sddc,
 				(void *)zram_get_handle(zram, index), page);
 		zram_slot_unlock(zram, index);
-		WARN_ON_ONCE(ret);
 		return ret;
 	}
 #endif
@@ -1964,6 +1985,7 @@ static struct attribute *zram_disk_attrs[] = {
 	&dev_attr_debug_stat.attr,
 #ifdef CONFIG_ZRAM_SDDC
 	&dev_attr_sddc_stat.attr,
+	&dev_attr_sddc_mode.attr,
 #endif
 	NULL,
 };
