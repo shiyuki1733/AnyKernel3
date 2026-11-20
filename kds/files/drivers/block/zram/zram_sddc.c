@@ -52,6 +52,10 @@
 
 /* LZ4KD needs >= 5 bytes of delta input and the wire must fit one page. */
 #define SDDC_DELTA_LIMIT	(PAGE_SIZE - SDDC_HDR_BYTES)
+
+/* Breadcrumbs: the last one printed before a hang names the failing step. */
+#define SDDC_DBG	pr_warn
+#define SDDC_MARK(_tag, _a, _b)	SDDC_DBG("KDSDBG %s %d %u\n", _tag, _a, _b)
 #define SDDC_DELTA_MIN_BYTES	8
 
 enum sddc_kind {
@@ -258,6 +262,8 @@ static int sddc_store(struct zram_sddc *sddc, struct page *page,
 	unsigned int slen = 0, dlen = 0, wire_len;
 	u32 sample, shash;
 	int i, ncand = 0, ret = 0, sel = -1;
+	static atomic_t dbg_cnt = ATOMIC_INIT(0);
+	bool trace = atomic_inc_return(&dbg_cnt) <= 48;
 
 	pagebuf = kmap_atomic(page);
 	memcpy(sddc->enc_pair + PAGE_SIZE, pagebuf, PAGE_SIZE);
@@ -324,21 +330,31 @@ static int sddc_store(struct zram_sddc *sddc, struct page *page,
 			if (!c)
 				continue;
 
+			if (trace)
+				SDDC_MARK("d-read", i, c->wire_len);
 			sddc_read_stream(sddc, c->handle, c->wire_len,
 					 sddc->enc_tmp);
+			if (trace)
+				SDDC_MARK("d-rdok", i, 0);
 			zstrm = zcomp_stream_get(sddc->comp);
 			ret = zcomp_decompress(zstrm, sddc->enc_tmp,
 					       c->wire_len, sddc->enc_pair);
+			if (trace)
+				SDDC_MARK("d-refdec", i, (unsigned)-ret);
 			if (!ret)
 				ret = zcomp_compress_delta(zstrm,
 						sddc->enc_pair,
 						sddc->enc_pair + PAGE_SIZE,
 						&dlen, SDDC_DELTA_LIMIT);
+			if (trace)
+				SDDC_MARK("d-enc", i, dlen);
 			if (!ret && (dlen < SDDC_DELTA_MIN_BYTES ||
 				     dlen > SDDC_DELTA_LIMIT))
 				ret = -E2BIG;
 			if (!ret) {
 				memcpy(payload, zstrm->buffer, dlen);
+				if (trace)
+					SDDC_MARK("d-copy", i, dlen);
 				/*
 				 * Round-trip proof, exactly like the reference
 				 * implementation: never commit a delta that the
@@ -348,13 +364,20 @@ static int sddc_store(struct zram_sddc *sddc, struct page *page,
 				       PAGE_SIZE);
 				memcpy(sddc->proof_pair + PAGE_SIZE,
 				       sddc->enc_pair + PAGE_SIZE, PAGE_SIZE);
-				if (zcomp_decompress_delta(zstrm, payload, dlen,
+				if (trace)
+					SDDC_MARK("d-proof", i, dlen);
+				ret = zcomp_decompress_delta(zstrm, payload, dlen,
 						sddc->proof_pair,
-						sddc->proof_pair + PAGE_SIZE) ||
+						sddc->proof_pair + PAGE_SIZE);
+				if (trace)
+					SDDC_MARK("d-pdec", i, (unsigned)-ret);
+				if (!ret &&
 				    memcmp(sddc->proof_pair + PAGE_SIZE,
 					   sddc->enc_pair + PAGE_SIZE,
 					   PAGE_SIZE))
 					proof_bad = true;
+				if (trace)
+					SDDC_MARK("d-pcmp", i, proof_bad);
 			}
 			zcomp_stream_put(sddc->comp);
 			if (proof_bad) {
@@ -395,6 +418,8 @@ static int sddc_store(struct zram_sddc *sddc, struct page *page,
 			if (sddc_zs_write(sddc, sddc->enc_out, wire_len,
 					  &handle))
 				goto plain;
+			if (trace)
+				SDDC_MARK("d-wrote", sel, wire_len);
 
 			meta = kzalloc(sizeof(*meta), GFP_NOIO);
 			if (!meta) {
@@ -465,11 +490,14 @@ int zram_sddc_load(struct zram_sddc *sddc, void *meta_ptr, struct page *page)
 	struct sddc_wire_hdr *hdr;
 	void *pagebuf;
 	int ret = -EIO;
+	static atomic_t dbg_cnt = ATOMIC_INIT(0);
+	bool trace;
 
 	if (!meta)
 		return -EIO;
 
 	spin_lock(&sddc->dec_lock);
+	trace = atomic_inc_return(&dbg_cnt) <= 48;
 
 	if (meta->kind == SDDC_KIND_REF || meta->kind == SDDC_KIND_ALIAS) {
 		ref = (meta->kind == SDDC_KIND_REF) ? meta : meta->ref;
@@ -496,6 +524,8 @@ int zram_sddc_load(struct zram_sddc *sddc, void *meta_ptr, struct page *page)
 	if (!ref)
 		goto out;
 
+	if (trace)
+		SDDC_MARK("l-wire", meta->wire_len, 0);
 	sddc_read_stream(sddc, meta->handle, meta->wire_len, sddc->dec_hdr);
 	hdr = sddc->dec_hdr;
 	if (hdr->magic != SDDC_MAGIC || hdr->version != SDDC_VERSION ||
@@ -505,19 +535,29 @@ int zram_sddc_load(struct zram_sddc *sddc, void *meta_ptr, struct page *page)
 	    hdr->payload_hash != sddc_hash_bytes(sddc->dec_hdr + SDDC_HDR_BYTES,
 						 hdr->payload_len)) {
 		atomic64_inc(&sddc->read_errors);
+		if (trace)
+			SDDC_MARK("l-badhdr", hdr->payload_len, meta->wire_len);
 		goto out;
 	}
+	if (trace)
+		SDDC_MARK("l-hdrok", hdr->payload_len, 0);
 
 	sddc_read_stream(sddc, ref->handle, ref->wire_len, sddc->dec_tmp);
 	zstrm = zcomp_stream_get(sddc->comp);
 	ret = zcomp_decompress(zstrm, sddc->dec_tmp, ref->wire_len,
 			       sddc->dec_pair);
+	if (trace)
+		SDDC_MARK("l-refdec", ref->wire_len, (unsigned)-ret);
 	if (!ret) {
 		void *payload = sddc->dec_hdr + SDDC_HDR_BYTES;
 
+		if (trace)
+			SDDC_MARK("l-ddec", hdr->payload_len, 0);
 		ret = zcomp_decompress_delta(zstrm, payload, hdr->payload_len,
 					     sddc->dec_pair,
 					     sddc->dec_pair + PAGE_SIZE);
+		if (trace)
+			SDDC_MARK("l-dok", hdr->payload_len, (unsigned)-ret);
 		if (!ret) {
 			pagebuf = kmap_atomic(page);
 			memcpy(pagebuf, sddc->dec_pair + PAGE_SIZE, PAGE_SIZE);
