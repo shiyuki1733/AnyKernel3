@@ -117,6 +117,14 @@ struct zram_sddc {
 	atomic64_t fallbacks;
 	atomic64_t read_errors;
 	atomic64_t proof_failures;
+
+	/* Last load failure snapshot, exported via /sys/block/zramX/sddc_stat. */
+	u32 dbg_stage;	/* 0 ok, 1 badhdr, 2 refdec, 3 ddec */
+	u32 dbg_magic, dbg_kind, dbg_plen, dbg_wire;
+	u32 dbg_ref_hash, dbg_hdr_ref, dbg_phash, dbg_calc_phash;
+	int dbg_refdec_ret, dbg_ddec_ret;
+	u32 last_slen, last_dlen, last_wire;
+	u8 dbg_ref_head[16], dbg_tgt_head[16];
 };
 
 static u32 sddc_hash_bytes(const void *buf, unsigned int len)
@@ -281,6 +289,7 @@ static int sddc_store(struct zram_sddc *sddc, struct page *page,
 	}
 	memcpy(sddc->enc_out, zstrm->buffer, slen);
 	zcomp_stream_put(sddc->comp);
+	sddc->last_slen = slen;
 
 	shash = sddc_hash_bytes(sddc->enc_out, slen);
 
@@ -415,6 +424,8 @@ static int sddc_store(struct zram_sddc *sddc, struct page *page,
 					SDDC_HDR_BYTES, dlen);
 
 			wire_len = SDDC_HDR_BYTES + dlen;
+			sddc->last_dlen = dlen;
+			sddc->last_wire = wire_len;
 			if (sddc_zs_write(sddc, sddc->enc_out, wire_len,
 					  &handle))
 				goto plain;
@@ -528,12 +539,22 @@ int zram_sddc_load(struct zram_sddc *sddc, void *meta_ptr, struct page *page)
 		SDDC_MARK("l-wire", meta->wire_len, 0);
 	sddc_read_stream(sddc, meta->handle, meta->wire_len, sddc->dec_hdr);
 	hdr = sddc->dec_hdr;
+	sddc->dbg_magic = hdr->magic;
+	sddc->dbg_kind = hdr->kind;
+	sddc->dbg_plen = hdr->payload_len;
+	sddc->dbg_wire = meta->wire_len;
+	sddc->dbg_hdr_ref = hdr->ref_hash;
+	sddc->dbg_ref_hash = ref->stream_hash;
+	sddc->dbg_phash = hdr->payload_hash;
+	sddc->dbg_calc_phash = sddc_hash_bytes(
+			sddc->dec_hdr + SDDC_HDR_BYTES, hdr->payload_len);
 	if (hdr->magic != SDDC_MAGIC || hdr->version != SDDC_VERSION ||
 	    hdr->kind != SDDC_KIND_DELTA ||
 	    hdr->payload_len + SDDC_HDR_BYTES != meta->wire_len ||
 	    hdr->ref_hash != ref->stream_hash ||
 	    hdr->payload_hash != sddc_hash_bytes(sddc->dec_hdr + SDDC_HDR_BYTES,
 						 hdr->payload_len)) {
+		sddc->dbg_stage = 1;
 		atomic64_inc(&sddc->read_errors);
 		if (trace)
 			SDDC_MARK("l-badhdr", hdr->payload_len, meta->wire_len);
@@ -546,26 +567,33 @@ int zram_sddc_load(struct zram_sddc *sddc, void *meta_ptr, struct page *page)
 	zstrm = zcomp_stream_get(sddc->comp);
 	ret = zcomp_decompress(zstrm, sddc->dec_tmp, ref->wire_len,
 			       sddc->dec_pair);
+	sddc->dbg_refdec_ret = ret;
 	if (trace)
 		SDDC_MARK("l-refdec", ref->wire_len, (unsigned)-ret);
 	if (!ret) {
 		void *payload = sddc->dec_hdr + SDDC_HDR_BYTES;
 
+		memcpy(sddc->dbg_ref_head, sddc->dec_pair, 16);
 		if (trace)
 			SDDC_MARK("l-ddec", hdr->payload_len, 0);
 		ret = zcomp_decompress_delta(zstrm, payload, hdr->payload_len,
 					     sddc->dec_pair,
 					     sddc->dec_pair + PAGE_SIZE);
+		sddc->dbg_ddec_ret = ret;
 		if (trace)
 			SDDC_MARK("l-dok", hdr->payload_len, (unsigned)-ret);
 		if (!ret) {
+			memcpy(sddc->dbg_tgt_head, sddc->dec_pair + PAGE_SIZE, 16);
+			sddc->dbg_stage = 0;
 			pagebuf = kmap_atomic(page);
 			memcpy(pagebuf, sddc->dec_pair + PAGE_SIZE, PAGE_SIZE);
 			kunmap_atomic(pagebuf);
 		} else {
+			sddc->dbg_stage = 3;
 			atomic64_inc(&sddc->read_errors);
 		}
 	} else {
+		sddc->dbg_stage = 2;
 		atomic64_inc(&sddc->read_errors);
 	}
 	zcomp_stream_put(sddc->comp);
@@ -648,4 +676,37 @@ void zram_sddc_destroy(struct zram_sddc *sddc)
 	free_page((unsigned long)sddc->dec_hdr);
 	free_page((unsigned long)sddc->dec_tmp);
 	kfree(sddc);
+}
+
+ssize_t zram_sddc_stat(struct zram_sddc *sddc, char *buf, size_t len)
+{
+	char rh[33], th[33];
+	int i;
+
+	if (!sddc)
+		return scnprintf(buf, len, "sddc=off\n");
+	for (i = 0; i < 16; i++) {
+		snprintf(rh + 2 * i, 3, "%02x", sddc->dbg_ref_head[i]);
+		snprintf(th + 2 * i, 3, "%02x", sddc->dbg_tgt_head[i]);
+	}
+	rh[32] = 0;
+	th[32] = 0;
+	return scnprintf(buf, len,
+		"alias=%llu delta=%llu fallback=%llu read_err=%llu proof_fail=%llu\n"
+		"stage=%u magic=%08x kind=%u plen=%u wire=%u\n"
+		"ref_hash=%08x hdr_ref=%08x phash=%08x calc_phash=%08x\n"
+		"refdec_ret=%d ddec_ret=%d last_slen=%u last_dlen=%u last_wire=%u\n"
+		"ref_head=%s tgt_head=%s\n",
+		(u64)atomic64_read(&sddc->alias_hits),
+		(u64)atomic64_read(&sddc->delta_hits),
+		(u64)atomic64_read(&sddc->fallbacks),
+		(u64)atomic64_read(&sddc->read_errors),
+		(u64)atomic64_read(&sddc->proof_failures),
+		sddc->dbg_stage, sddc->dbg_magic, sddc->dbg_kind,
+		sddc->dbg_plen, sddc->dbg_wire,
+		sddc->dbg_ref_hash, sddc->dbg_hdr_ref,
+		sddc->dbg_phash, sddc->dbg_calc_phash,
+		sddc->dbg_refdec_ret, sddc->dbg_ddec_ret,
+		sddc->last_slen, sddc->last_dlen, sddc->last_wire,
+		rh, th);
 }

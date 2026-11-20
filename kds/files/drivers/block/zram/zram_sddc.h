@@ -28,5 +28,6 @@ int zram_sddc_store(struct zram_sddc *sddc, struct page *page,
 		    struct zram_sddc_store *out);
 int zram_sddc_load(struct zram_sddc *sddc, void *meta, struct page *page);
 void zram_sddc_free_slot(struct zram_sddc *sddc, void *meta);
+ssize_t zram_sddc_stat(struct zram_sddc *sddc, char *buf, size_t len);
 
 #endif

@@ -1159,6 +1159,21 @@ static ssize_t debug_stat_show(struct device *dev,
 	return ret;
 }
 
+#ifdef CONFIG_ZRAM_SDDC
+static ssize_t sddc_stat_show(struct device *dev,
+		struct device_attribute *attr, char *buf)
+{
+	struct zram *zram = dev_to_zram(dev);
+	ssize_t ret;
+
+	down_read(&zram->init_lock);
+	ret = zram_sddc_stat(zram->sddc, buf, PAGE_SIZE);
+	up_read(&zram->init_lock);
+	return ret;
+}
+static DEVICE_ATTR_RO(sddc_stat);
+#endif
+
 static DEVICE_ATTR_RO(io_stat);
 static DEVICE_ATTR_RO(mm_stat);
 #ifdef CONFIG_ZRAM_WRITEBACK
@@ -1947,6 +1962,9 @@ static struct attribute *zram_disk_attrs[] = {
 	&dev_attr_bd_stat.attr,
 #endif
 	&dev_attr_debug_stat.attr,
+#ifdef CONFIG_ZRAM_SDDC
+	&dev_attr_sddc_stat.attr,
+#endif
 	NULL,
 };
 
