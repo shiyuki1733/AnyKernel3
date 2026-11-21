@@ -124,6 +124,7 @@ struct zram_sddc {
 	atomic64_t fallbacks;
 	atomic64_t read_errors;
 	atomic64_t proof_failures;
+	atomic64_t re_pin, re_plain, re_hdr, re_refdec, re_ddec;
 
 	atomic64_t store_total;
 	atomic64_t cand_total;
@@ -141,6 +142,9 @@ struct zram_sddc {
 	u32 dbg_magic, dbg_kind, dbg_plen, dbg_wire;
 	u32 dbg_ref_hash, dbg_hdr_ref, dbg_phash, dbg_calc_phash;
 	int dbg_refdec_ret, dbg_ddec_ret;
+	int dbg_store_refdec_ret;
+	u32 dbg_store_wire;
+	u8 dbg_store_head[16];
 	u32 last_slen, last_dlen, last_wire;
 	u8 dbg_ref_head[16], dbg_tgt_head[16];
 	atomic64_t load_entries;
@@ -430,8 +434,12 @@ static int sddc_store(struct zram_sddc *sddc, struct page *page,
 					       c->wire_len, sddc->enc_pair);
 			if (trace)
 				SDDC_MARK("d-refdec", i, (unsigned)-ret);
-			if (ret)
+			if (ret) {
 				atomic64_inc(&sddc->miss_refdec);
+				sddc->dbg_store_refdec_ret = ret;
+				sddc->dbg_store_wire = c->wire_len;
+				memcpy(sddc->dbg_store_head, sddc->enc_tmp, 16);
+			}
 			if (!ret)
 				ret = zcomp_compress_delta(zstrm,
 						sddc->enc_pair,
@@ -605,6 +613,7 @@ int zram_sddc_load(struct zram_sddc *sddc, void *meta_ptr, struct page *page)
 		ref = sddc_pin_ref(sddc, (meta->kind == SDDC_KIND_REF) ?
 				   meta : meta->ref);
 		if (!ref) {
+			atomic64_inc(&sddc->re_pin);
 			atomic64_inc(&sddc->read_errors);
 			goto out;
 		}
@@ -622,8 +631,10 @@ int zram_sddc_load(struct zram_sddc *sddc, void *meta_ptr, struct page *page)
 			sddc->dbg_pg_off = ((u8 *)pagebuf)[107];
 		}
 		kunmap_atomic(pagebuf);
-		if (ret)
+		if (ret) {
+			atomic64_inc(&sddc->re_plain);
 			atomic64_inc(&sddc->read_errors);
+		}
 		goto out;
 	}
 
@@ -632,6 +643,7 @@ int zram_sddc_load(struct zram_sddc *sddc, void *meta_ptr, struct page *page)
 
 	ref = sddc_pin_ref(sddc, meta->ref);
 	if (!ref) {
+		atomic64_inc(&sddc->re_pin);
 		atomic64_inc(&sddc->read_errors);
 		goto out;
 	}
@@ -657,6 +669,7 @@ int zram_sddc_load(struct zram_sddc *sddc, void *meta_ptr, struct page *page)
 	    hdr->payload_hash != sddc_hash_bytes(sddc->dec_hdr + SDDC_HDR_BYTES,
 						 hdr->payload_len)) {
 		sddc->dbg_stage = 1;
+		atomic64_inc(&sddc->re_hdr);
 		atomic64_inc(&sddc->read_errors);
 		if (trace)
 			SDDC_MARK("l-badhdr", hdr->payload_len, meta->wire_len);
@@ -695,10 +708,13 @@ int zram_sddc_load(struct zram_sddc *sddc, void *meta_ptr, struct page *page)
 			kunmap_atomic(pagebuf);
 		} else {
 			sddc->dbg_stage = 3;
+			atomic64_inc(&sddc->re_ddec);
 			atomic64_inc(&sddc->read_errors);
 		}
 	} else {
 		sddc->dbg_stage = 2;
+		atomic64_inc(&sddc->re_refdec);
+		memcpy(sddc->dbg_ref_head, sddc->dec_tmp, 16);
 		atomic64_inc(&sddc->read_errors);
 	}
 	zcomp_stream_put(sddc->comp);
@@ -826,7 +842,7 @@ void zram_sddc_mode_set(struct zram_sddc *sddc, int mode)
 
 ssize_t zram_sddc_stat(struct zram_sddc *sddc, char *buf, size_t len)
 {
-	char rh[33], th[33], ph[33];
+	char rh[33], th[33], ph[33], sh[33];
 	int i;
 
 	if (!sddc)
@@ -835,16 +851,20 @@ ssize_t zram_sddc_stat(struct zram_sddc *sddc, char *buf, size_t len)
 		snprintf(rh + 2 * i, 3, "%02x", sddc->dbg_ref_head[i]);
 		snprintf(th + 2 * i, 3, "%02x", sddc->dbg_tgt_head[i]);
 		snprintf(ph + 2 * i, 3, "%02x", sddc->dbg_pg_head[i]);
+		snprintf(sh + 2 * i, 3, "%02x", sddc->dbg_store_head[i]);
 	}
 	rh[32] = 0;
 	th[32] = 0;
 	ph[32] = 0;
+	sh[32] = 0;
 	return scnprintf(buf, len,
 		"alias=%llu delta=%llu fallback=%llu read_err=%llu proof_fail=%llu load_entries=%llu\n"
+		"re_pin=%llu re_plain=%llu re_hdr=%llu re_refdec=%llu re_ddec=%llu\n"
 		"store=%llu cand=%llu miss_small=%llu miss_refdec=%llu miss_enc=%llu miss_size=%llu miss_proof=%llu miss_wire=%llu miss_class=%llu meta_alive=%lld mode=%d comp=%s has_delta=%d tried=%llu nodelta=%llu\n"
 		"stage=%u magic=%08x kind=%u plen=%u wire=%u\n"
 		"ref_hash=%08x hdr_ref=%08x phash=%08x calc_phash=%08x\n"
 		"refdec_ret=%d ddec_ret=%d last_slen=%u last_dlen=%u last_wire=%u\n"
+		"store_refdec_ret=%d store_wire=%u store_head=%s\n"
 		"ref_head=%s tgt_head=%s pg_head=%s st_off=%u pg_off=%u\n",
 		(u64)atomic64_read(&sddc->alias_hits),
 		(u64)atomic64_read(&sddc->delta_hits),
@@ -852,6 +872,11 @@ ssize_t zram_sddc_stat(struct zram_sddc *sddc, char *buf, size_t len)
 		(u64)atomic64_read(&sddc->read_errors),
 		(u64)atomic64_read(&sddc->proof_failures),
 		(u64)atomic64_read(&sddc->load_entries),
+		(u64)atomic64_read(&sddc->re_pin),
+		(u64)atomic64_read(&sddc->re_plain),
+		(u64)atomic64_read(&sddc->re_hdr),
+		(u64)atomic64_read(&sddc->re_refdec),
+		(u64)atomic64_read(&sddc->re_ddec),
 		(u64)atomic64_read(&sddc->store_total),
 		(u64)atomic64_read(&sddc->cand_total),
 		(u64)atomic64_read(&sddc->miss_small),
@@ -872,5 +897,6 @@ ssize_t zram_sddc_stat(struct zram_sddc *sddc, char *buf, size_t len)
 		sddc->dbg_phash, sddc->dbg_calc_phash,
 		sddc->dbg_refdec_ret, sddc->dbg_ddec_ret,
 		sddc->last_slen, sddc->last_dlen, sddc->last_wire,
+		sddc->dbg_store_refdec_ret, sddc->dbg_store_wire, sh,
 		rh, th, ph, sddc->dbg_st_off, sddc->dbg_pg_off);
 }
